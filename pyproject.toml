@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-assistant-telegram"
+version = "0.1.0"
+description = "Telegram bot bridge for Claude Code with integrated polling and batch replies."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+  { name = "Fabio Pauli" }
+]
+dependencies = [
+  "requests>=2.31.0",
+  "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+claude-assistant = "claude_assistant:main"
+
+[tool.setuptools]
+py-modules = ["claude_assistant"]

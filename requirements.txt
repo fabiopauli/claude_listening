@@ -1,0 +1,6 @@
+# Python dependencies for the Claude Telegram worker.
+# Browser automation uses the external `agent-browser` CLI:
+# https://agent-browser.dev
+# It is not installed from this requirements file.
+requests>=2.31.0
+python-dotenv>=1.0.0
