@@ -9,3 +9,6 @@ telegram_inbox.jsonl
 telegram_history.log
 .telegram_offset
 .codex_assistant.lock
+*.aux
+*.out
+*.toc

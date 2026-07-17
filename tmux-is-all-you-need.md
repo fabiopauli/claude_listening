@@ -130,7 +130,9 @@ the **orchestrator agent** that, given those representations, generates the next
 instructions one at a time, autoregressively consuming its own prior decisions. The
 Tmux Orchestration Architecture follows this overall structure using stacked panes,
 content- and address-based attention, and per-agent feed-forward reasoning, shown
-schematically below.
+schematically below. (We assume tmux ≥ 3.2 throughout: pane-scoped user options,
+`list-panes` filters, and `display-popup` are comparatively recent arrivals; on
+older servers the architecture degrades gracefully to fewer heads and more `grep`.)
 
 ```
                        ┌─────────────────────────────────────────┐
@@ -263,6 +265,12 @@ tmux load-buffer  -b task ./subtask-prompt.txt
 tmux paste-buffer -b task -t "$target"
 ```
 
+Two practical notes. First, `send-keys` interprets key names — `Enter`, `C-c` — so
+literal payloads should be sent with `-l`, lest a string containing "Enter" be
+helpfully pressed on the worker's behalf. Second, keys land in whatever the pane is
+doing *right now*; dispatch is therefore gated on the worker being at rest (§3.5),
+since injecting a subtask into an agent mid-generation adds noise without gradient.
+
 #### 3.2.2 Multi-Head Orchestration
 
 Rather than run a single orchestration channel over the full swarm, we found it
@@ -341,6 +349,13 @@ exclusion over the shared working tree, preventing two workers from writing the 
 files concurrently — the coordination analog of not letting two FFNs update the same
 position at once.
 
+One sharp edge deserves emphasis: channels are server-global and signals are *not
+queued*. A `wait-for -S` fired while no one is waiting is simply lost, and a waiter
+arriving afterwards blocks forever — the barrier must be armed *before* the subtask
+that will signal it is dispatched. Recursive sub-swarms sharing a socket must
+namespace their channels; better, give each sub-swarm its own socket (§3.1) so the
+collision is impossible by construction.
+
 ### 3.4 Embeddings and Readout
 
 Before a subtask enters the swarm it is *embedded* into the substrate: a natural
@@ -379,7 +394,7 @@ polling, which is where tmux's notification system does real work:
 ```bash
 # Stamp a pane's position in time whenever it goes quiet (likely: finished a step)
 tmux set-hook -g alert-silence \
-  'set-option -p @last_silent "#{t:#{now}}" ; run-shell "notify-orchestrator #{pane_id}"'
+  'set-option -p @last_silent "#{t:window_activity}" ; run-shell "notify-orchestrator #{pane_id}"'
 
 # React to a worker crashing (a "position" removed from the sequence)
 tmux set-hook -g pane-died \
@@ -388,10 +403,17 @@ tmux set-hook -g pane-died \
 
 Available hook events include `pane-died`, `alert-activity`, `alert-silence`,
 `alert-bell`, `session-created`, `client-attached`, and `client-detached`, among
-others [tmux Hooks wiki]. Activity/silence monitoring is enabled per window with
-`monitor-activity on` and `monitor-silence <seconds>`; a pane that has been silent
-for *s* seconds is, with high probability, a worker that has finished its step and
-is waiting — precisely the event the orchestrator must attend to next. This gives
+others [tmux Hooks wiki]. Note that `pane-died` fires only when `remain-on-exit` is
+`on`, leaving the corpse addressable for a `capture-pane` post-mortem before
+`respawn-pane`; with the default `off` the pane closes and the weaker `pane-exited`
+fires — the evidence leaves with it. Activity/silence monitoring is enabled per
+window with `monitor-activity on` and `monitor-silence <seconds>`; a pane that has
+been silent for *s* seconds is, with high probability, a worker that has finished
+its step and is waiting — precisely the event the orchestrator must attend to next.
+The heuristic admits false positives — an agent deep in a long inference is also
+silent — so silence is corroborated against the pane's key before acting:
+`pane_current_command` back at a shell is completion; still `claude` is
+contemplation. This gives
 the swarm a *positional* sense of "who just spoke and who just went quiet" that is
 computed once, event-drivenly, rather than re-derived by a sequential human sweep.
 
@@ -427,6 +449,15 @@ the human from each hop but re-introduces an *O(n)* bottleneck at the process th
 must parse and re-emit every message; tmux avoids this because the *substrate
 itself* is the router — panes are directly addressable and can be wired
 worker-to-worker without a relay.
+
+An adversarial reader will object that the tmux server is itself a single central
+process. The distinction is the layer at which it routes: the server moves bytes
+between pseudo-terminals without parsing them, holds no conversation state, and
+re-emits nothing through a language model's context window. The *O(n)* we charge
+the central-process design is *semantic* bandwidth — every message crossing an
+application-level orchestrator's parse–decide–re-emit cycle — not file-descriptor
+bandwidth. Table 1 counts transport and decision operations; the orchestrator's own
+reasoning cost is identical across substrates and is not what any column measures.
 
 Two further, non-tabulated benefits motivated the choice of tmux:
 
@@ -628,9 +659,11 @@ scheduling, expressed entirely in tmux:
 set -euo pipefail
 SOCK="swarm"                       # isolated server namespace: tmux -L "$SOCK"
 T() { tmux -L "$SOCK" "$@"; }
+mkdir -p logs
 
 # 1. Create the durable, detached session (survives human detach).
 T new-session -d -s proj -n impl
+T set-option -g remain-on-exit on   # corpses stay addressable => pane-died fires
 
 # 2. Spawn two worker panes, each an independent coding agent, tagged by role.
 T send-keys -t proj:impl.0 'claude'  Enter ; T set-option -p -t proj:impl.0 @role worker
@@ -650,12 +683,13 @@ done
 T set-hook -g alert-silence 'run-shell "orchestrator wake #{pane_id}"'
 T set-hook -g pane-died     'run-shell "orchestrator handle-death #{pane_id} #{pane_dead_status}"'
 for p in proj:impl.0 proj:impl.1; do
-  T set-option -t "${p%.*}" monitor-silence 20     # silence => finished a step
+  T set-option -w -t "${p%.*}" monitor-silence 20  # silence => finished a step
 done
 
 # 6. Attend: read a worker, decide, route the next subtask (the control loop).
 read_pane()  { T capture-pane -p -t "$1" -S -200; }
-route()      { T send-keys -t "$1" "$2" Enter; }
+route()      { T send-keys -t "$1" -l "$2"; T send-keys -t "$1" Enter; }
+barrier()    { T wait-for "$1"; }  # arm BEFORE dispatching the task that signals it
 gate()       { T display-popup -t proj -E "orchestrator review --hold $1"; }  # human, eventually
 
 # 7. Human attaches at the root to supervise; detaching leaves the swarm running.

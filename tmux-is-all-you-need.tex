@@ -16,6 +16,9 @@
 \usepackage{titlesec}
 \usepackage{listings}
 \usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{positioning,fit,arrows.meta,calc}
 \usepackage[hidelinks]{hyperref}
 
 % --- Section styling reminiscent of the NeurIPS template -----------
@@ -183,32 +186,98 @@ is the \textbf{orchestrator agent} that, given those representations, generates 
 next instructions one at a time, autoregressively consuming its own prior decisions.
 The Tmux Orchestration Architecture follows this overall structure using stacked
 panes, content- and address-based attention, and per-agent feed-forward reasoning,
-shown schematically in Figure~\ref{fig:arch}.
+shown schematically in Figure~\ref{fig:arch}.\footnote{We assume tmux $\geq$ 3.2
+throughout: pane-scoped user options, \code{list-panes} filters, and
+\code{display-popup} are comparatively recent arrivals. On older servers the
+architecture degrades gracefully to fewer heads and more \code{grep}.}
 
 \begin{figure}[t]
-\begin{lstlisting}
-                     +-----------------------------------------------+
- Human (root client) |  attach / detach  .  choose-tree  .  gate     |
-                     +-----------------------+-----------------------+
-                                             |  (in the loop, eventually)
-                                     +-------v--------+
-                                     |  Orchestrator  |  (decoder)
-                                     |  send-keys  v  |
-                                     |  capture    ^  |
-                                     +---+-----+-----++
-                    +--------------------+     |     +------------------+
-              +-----v------+       +-----v------+           +-----v------+
-              |  Worker 1  |       |  Worker 2  |    ...    |  Worker n  |  (encoder stack)
-              | Claude/Codex|      | Claude/Codex|          | Claude/Codex|
-              +-----+------+       +------------+           +-----+------+
-                    | (recursion: a worker may itself run tmux)   |
-              +-----v------+                                +-----v------+
-              | sub-swarm  |                                | sub-swarm  |
-              +------------+                                +------------+
-\end{lstlisting}
-\caption{The Tmux Orchestration Architecture. An orchestrator (decoder) attends over
-a stack of worker panes (encoder) via \code{send-keys}/\code{capture-pane}; workers
-may recurse into sub-swarms; the human attaches at the root as a supervisory gate.}
+\centering
+\resizebox{0.94\textwidth}{!}{%
+\begin{tikzpicture}[font=\footnotesize,
+  every node/.style={align=center},
+  attn/.style={draw, rounded corners=2pt, fill=orange!30, minimum width=15.5em, minimum height=2.3em, inner sep=2pt},
+  ffn/.style={attn, fill=blue!15},
+  addg/.style={draw, rounded corners=2pt, fill=yellow!40, minimum width=15.5em, minimum height=1.3em, font=\scriptsize, inner sep=2pt},
+  emb/.style={draw, rounded corners=2pt, fill=red!15, minimum width=13em, minimum height=2.1em},
+  gate/.style={attn, fill=green!25},
+  soft/.style={attn, fill=teal!20},
+  plus/.style={draw, circle, inner sep=1.2pt},
+  arr/.style={-{Stealth[length=1.8mm]}, semithick},
+  darr/.style={arr, dashed}]
+
+% ---------------- encoder (worker) column ----------------
+\node[emb] (eemb) at (0,0) {Subtask Embedding\\[-2pt]{\ttfamily\scriptsize send-keys / paste-buffer}};
+\node[plus, above=0.28cm of eemb] (eplus) {$+$};
+\node[attn, above=0.42cm of eplus] (eatt) {Worker Self-Attention\\[-2pt]{\ttfamily\scriptsize capture-pane -t A | send-keys -t B}};
+\node[addg, above=0.22cm of eatt] (eadd1) {Add \& Gate \enspace(scrollback $+$ {\ttfamily pipe-pane} log)};
+\node[ffn, above=0.3cm of eadd1] (effn) {Per-Agent Feed-Forward\\[-2pt](the LLM inside the pane)};
+\node[addg, above=0.22cm of effn] (eadd2) {Add \& Gate};
+\node[draw, rounded corners=5pt, fit=(eatt)(eadd2), inner sep=0.4em] (encbox) {};
+\node[font=\scriptsize, anchor=east, xshift=-3pt] at (encbox.west |- effn) {$N\times$\\panes};
+
+% ---------------- decoder (orchestrator) column ----------------
+\node[emb, right=3.0cm of eemb] (demb) {Decision Embedding\\[-2pt]{\scriptsize(orchestrator scrollback, shifted right)}};
+\node[plus, above=0.28cm of demb] (dplus) {$+$};
+\node[attn, above=0.42cm of dplus] (datt1) {Masked Self-Attention\\[-2pt]{\ttfamily\scriptsize wait-for} {\scriptsize barriers}};
+\node[addg, above=0.22cm of datt1] (dadd1) {Add \& Gate};
+\node[attn, above=0.3cm of dadd1] (datt2) {Orchestrator--Worker Cross-Attention\\[-2pt]{\ttfamily\scriptsize capture-pane / send-keys}};
+\node[addg, above=0.22cm of datt2] (dadd2) {Add \& Gate};
+\node[ffn, above=0.3cm of dadd2] (dffn) {Feed-Forward\\[-2pt]{\scriptsize(orchestrator reasoning)}};
+\node[addg, above=0.22cm of dffn] (dadd3) {Add \& Gate};
+\node[draw, rounded corners=5pt, fit=(datt1)(dadd3), inner sep=0.4em] (decbox) {};
+\node[font=\scriptsize, anchor=west, xshift=3pt] at (decbox.east |- datt2) {$h\times$\\heads\\(windows)};
+
+% ---------------- output head ----------------
+\node[soft, above=0.5cm of dadd3, minimum width=13em] (lin) {Linear: format filters \enspace{\ttfamily\scriptsize list-panes -f}};
+\node[soft, above=0.25cm of lin, minimum width=13em] (smax) {Softmax: top-$k$ pane selection};
+\node[gate, above=0.25cm of smax, minimum width=13em] (hgate) {Human Gate\\[-2pt]{\ttfamily\scriptsize display-popup / confirm-before}};
+\node[font=\scriptsize, above=0.3cm of hgate] (out) {next control action};
+
+% ---------------- arrows ----------------
+\node[font=\scriptsize, below=0.3cm of eemb] (etask) {task stream};
+\node[font=\scriptsize, below=0.3cm of demb] (dtask) {prior decisions};
+\draw[arr] (etask) -- (eemb);
+\draw[arr] (eemb) -- (eplus);
+\draw[arr] (eplus) -- (eatt);
+\draw[arr] (eatt) -- (eadd1);
+\draw[arr] (eadd1) -- (effn);
+\draw[arr] (effn) -- (eadd2);
+\draw[arr] (dtask) -- (demb);
+\draw[arr] (demb) -- (dplus);
+\draw[arr] (dplus) -- (datt1);
+\draw[arr] (datt1) -- (dadd1);
+\draw[arr] (dadd1) -- (datt2);
+\draw[arr] (datt2) -- (dadd2);
+\draw[arr] (dadd2) -- (dffn);
+\draw[arr] (dffn) -- (dadd3);
+\draw[arr] (dadd3) -- (lin);
+\draw[arr] (lin) -- (smax);
+\draw[arr] (smax) -- (hgate);
+\draw[arr] (hgate) -- (out);
+
+% cross-attention feed: encoder output -> decoder cross-attention
+\draw[arr] (encbox.east |- eadd2) -- ++(0.5,0) |- (datt2.west);
+
+% positional encodings
+\node[font=\scriptsize, left=0.45cm of eplus] (epe) {Positional\\Encoding\\{\scriptsize\ttfamily s:w.p}};
+\draw[arr] (epe) -- (eplus);
+\node[font=\scriptsize, right=0.45cm of dplus] (dpe) {Positional\\Encoding\\{\scriptsize hooks, \ttfamily \#\{t:\ldots\}}};
+\draw[arr] (dpe) -- (dplus);
+
+% recursion loop on the encoder stack
+\draw[darr] (encbox.west |- eadd1) .. controls +(-1.0,-0.45) and +(-1.0,0.45) .. (encbox.west |- eatt)
+  node[midway, left, font=\scriptsize, align=center, xshift=-2pt] {$d\times$ recursion\\{\scriptsize(a pane runs tmux)}};
+
+% the human attaches at the gate
+\draw[darr] ([xshift=-1.7cm]hgate.west) -- (hgate.west)
+  node[at start, anchor=east, font=\scriptsize, align=center] {human client\\{\scriptsize(attached, eventually)}};
+\end{tikzpicture}}
+\caption{The Tmux Orchestration Architecture, drawn in the family style. Worker panes
+(left, the encoder stack) and the orchestrator (right, the decoder) exchange
+information through \code{capture-pane}/\code{send-keys} cross-attention;
+\code{wait-for} masks the orchestrator's self-attention; the human gate sits where
+the softmax used to be.}
 \label{fig:arch}
 \end{figure}
 
@@ -265,12 +334,64 @@ tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} \
   cmd=#{pane_current_command} role=#{@role} dead=#{pane_dead}'
 \end{lstlisting}
 
+\begin{figure}[t]
+\centering
+\begin{minipage}[b]{0.44\textwidth}
+\centering
+\begin{tikzpicture}[font=\scriptsize, every node/.style={align=center},
+  box/.style={draw, rounded corners=2pt, minimum width=11em, minimum height=1.7em, inner sep=2pt},
+  arr/.style={-{Stealth[length=1.6mm]}, semithick}]
+\node[box, fill=gray!15] (score) {Score: format filter\\[-1pt]{\ttfamily list-panes -f '\#\{==:\#\{@role\},...\}'}};
+\node[box, fill=gray!15, above=0.28cm of score] (scale) {Scale: $1/\sqrt{d_k}$ \,(bound fan-out)};
+\node[box, fill=pink!40, above=0.28cm of scale] (mask) {Mask (opt.): {\ttfamily wait-for} barrier};
+\node[box, fill=green!20, above=0.28cm of mask] (smax) {Softmax $\rightarrow$ top-$k$ (hard)};
+\node[box, fill=orange!30, above=0.28cm of smax] (cap) {Read $V$: {\ttfamily capture-pane -p -t}};
+\node[below=0.35cm of score] (qk) {$q$ (subgoal) \qquad $K$ (pane metadata)};
+\draw[arr] ([xshift=-2.4em]qk.north) -- ([xshift=-2.4em]score.south);
+\draw[arr] ([xshift=2.8em]qk.north) -- ([xshift=2.8em]score.south);
+\draw[arr] (score) -- (scale);
+\draw[arr] (scale) -- (mask);
+\draw[arr] (mask) -- (smax);
+\draw[arr] (smax) -- (cap);
+\node[above=0.3cm of cap] (o) {attended output};
+\draw[arr] (cap) -- (o);
+\end{tikzpicture}
+\end{minipage}\hfill
+\begin{minipage}[b]{0.52\textwidth}
+\centering
+\begin{tikzpicture}[font=\scriptsize, every node/.style={align=center},
+  box/.style={draw, rounded corners=2pt, minimum width=11em, minimum height=1.7em, inner sep=2pt},
+  arr/.style={-{Stealth[length=1.6mm]}, semithick}]
+\node[box, fill=orange!30, minimum height=2.3em] (h2) at (0.18,0.18) {};
+\node[box, fill=orange!30, minimum height=2.3em] (h1) at (0.09,0.09) {};
+\node[box, fill=orange!30, minimum height=2.3em] (h0) at (0,0) {Scaled Selection\\[-1pt](one per window)};
+\node[right=0.3cm of h2, font=\scriptsize] (hh) {$h\times$};
+\node[box, fill=yellow!40, above=0.55cm of h2, minimum width=13em] (cat) {Concat: blackboard\\[-1pt]{\ttfamily set-option -g @blackboard/...}};
+\node[box, fill=teal!20, above=0.3cm of cat, minimum width=13em] (wo) {Linear $W^{O}$: reconciliation policy};
+\node[below=0.5cm of h0] (vkq) {$V$ \qquad $K$ \qquad $Q$};
+\draw[arr] ([xshift=-3em]vkq.north) -- ([xshift=-3em]h0.south);
+\draw[arr] (vkq.north) -- (h0.south);
+\draw[arr] ([xshift=3em]vkq.north) -- ([xshift=3em]h0.south);
+\draw[arr] (h2.north) -- (cat);
+\draw[arr] (cat) -- (wo);
+\node[above=0.3cm of wo] (mo) {MultiHead output};
+\draw[arr] (wo) -- (mo);
+\end{tikzpicture}
+\end{minipage}
+\caption{(left) Scaled Selection. (right) Multi-Head Orchestration: $h$ selection
+channels run in parallel windows and are combined through a shared blackboard.}
+\label{fig:attn}
+\end{figure}
+
 \subsubsection{Scaled Dot-Product Attention (Scaled Selection)}\label{sec:sdpa}
 
 We call our particular attention ``Scaled Selection.'' The input consists of a query
 $q$ (the current subgoal), keys $k_i$ of dimension $d_k$ (pane metadata), and values
 $v_i$ (pane contents). We compute a relevance score between the query and each pane's
-key, apply a softmax to obtain weights, and read the weighted values:
+key, apply a softmax to obtain weights, and read the weighted values
+(Figure~\ref{fig:attn}, left):\footnote{The vector space in which terminal
+scrollback admits convex combination is left as future work; in deployment the
+softmax temperature is taken to zero and the sum collapses to hard selection.}
 \begin{equation}
 \mathrm{OrchAttention}(q,K,V) =
   \sum_{i} \mathrm{softmax}_i\!\left(\frac{\mathrm{score}(q,k_i)}{\sqrt{d_k}}\right)
@@ -308,12 +429,19 @@ tmux load-buffer  -b task ./subtask-prompt.txt    # large payload, no escaping..
 tmux paste-buffer -b task -t "$target"            # ...injected into stdin
 \end{lstlisting}
 
+Two practical notes. First, \code{send-keys} interprets key names --- \code{Enter},
+\code{C-c} --- so literal payloads should be sent with \code{-l}, lest a string
+containing ``Enter'' be helpfully pressed on the worker's behalf. Second, keys land
+in whatever the pane is doing \emph{right now}; dispatch is therefore gated on the
+worker being at rest (\S\ref{sec:pe}), since injecting a subtask into an agent
+mid-generation adds noise without gradient.
+
 \subsubsection{Multi-Head Orchestration}\label{sec:mha}
 
 Rather than run a single orchestration channel over the full swarm, we found it
 beneficial to run $h$ channels in parallel --- one per tmux \textbf{window} --- each
 with its own selection projection (its own \code{@role} filter, subset of the swarm,
-and subgoal). Each head $i$ attends independently,
+and subgoal). Each head $i$ attends independently (Figure~\ref{fig:attn}, right),
 \begin{equation}
 \mathrm{head}_i = \mathrm{OrchAttention}\!\left(qW_i^{Q},\, KW_i^{K},\, VW_i^{V}\right),
 \end{equation}
@@ -369,6 +497,13 @@ tmux wait-for    subtask-42   # orchestrator/dependent: block until signalled
 exclusion over the shared working tree, preventing two workers from writing the same
 files concurrently.
 
+One sharp edge deserves emphasis: channels are server-global and signals are
+\emph{not queued}. A \code{wait-for -S} fired while no one is waiting is simply
+lost, and a waiter arriving afterwards blocks forever --- the barrier must be armed
+\emph{before} the subtask that will signal it is dispatched. Recursive sub-swarms
+sharing a socket must namespace their channels; better, give each sub-swarm its own
+socket (\S\ref{sec:stacks}) so the collision is impossible by construction.
+
 \subsection{Embeddings and Readout}
 
 Before a subtask enters the swarm it is \emph{embedded} into the substrate: a natural
@@ -407,7 +542,7 @@ polling:
 \begin{lstlisting}
 # Stamp a pane's position in time whenever it goes quiet (likely: finished a step)
 tmux set-hook -g alert-silence \
-  'set-option -p @last_silent "#{t:#{now}}" ; run-shell "notify-orch #{pane_id}"'
+  'set-option -p @last_silent "#{t:window_activity}" ; run-shell "notify-orch #{pane_id}"'
 # React to a worker crashing (a "position" removed from the sequence)
 tmux set-hook -g pane-died \
   'run-shell "orch handle-death #{pane_id} status=#{pane_dead_status}"'
@@ -415,11 +550,18 @@ tmux set-hook -g pane-died \
 
 Available hook events include \code{pane-died}, \code{alert-activity},
 \code{alert-silence}, \code{alert-bell}, \code{session-created},
-\code{client-attached}, and \code{client-detached} \cite{tmuxhooks}. Activity/silence
+\code{client-attached}, and \code{client-detached} \cite{tmuxhooks}. Note that
+\code{pane-died} fires only when \code{remain-on-exit} is \code{on}, leaving the
+corpse addressable for a \code{capture-pane} post-mortem before \code{respawn-pane};
+with the default \code{off} the pane closes and the weaker \code{pane-exited} fires
+--- the evidence leaves with it. Activity/silence
 monitoring is enabled per window with \code{monitor-activity on} and
 \code{monitor-silence <seconds>}; a pane silent for $s$ seconds is, with high
 probability, a worker that has finished its step and is waiting --- precisely the
-event the orchestrator must attend to next. This gives the swarm a \emph{positional}
+event the orchestrator must attend to next. The heuristic admits false positives ---
+an agent deep in a long inference is also silent --- so silence is corroborated
+against the pane's key before acting: \code{pane\_current\_command} back at a shell
+is completion; still \code{claude} is contemplation. This gives the swarm a \emph{positional}
 sense of ``who just spoke and who just went quiet,'' computed once and
 event-drivenly, rather than re-derived by a sequential human sweep.
 
@@ -460,6 +602,16 @@ one mind. A central-process orchestrator removes the human from each hop but
 re-introduces an $O(n)$ bottleneck at the process that must parse and re-emit every
 message; tmux avoids this because the \emph{substrate itself} is the router --- panes
 are directly addressable and can be wired worker-to-worker without a relay.
+
+An adversarial reader will object that the tmux server is itself a single central
+process. The distinction is the layer at which it routes: the server moves bytes
+between pseudo-terminals without parsing them, holds no conversation state, and
+re-emits nothing through a language model's context window. The $O(n)$ we charge the
+central-process design is \emph{semantic} bandwidth --- every message crossing an
+application-level orchestrator's parse--decide--re-emit cycle --- not file-descriptor
+bandwidth. Table~\ref{tab:why} counts transport and decision operations; the
+orchestrator's own reasoning cost is identical across substrates and is not what any
+column measures.
 
 Two further benefits motivated the choice of tmux. \textbf{Durability/detachability:}
 because the server outlives its clients, the human can detach entirely and the swarm
@@ -642,9 +794,11 @@ scheduling, expressed entirely in tmux.
 set -euo pipefail
 SOCK="swarm"                       # isolated server namespace: tmux -L "$SOCK"
 T() { tmux -L "$SOCK" "$@"; }
+mkdir -p logs
 
 # 1. Create the durable, detached session (survives human detach).
 T new-session -d -s proj -n impl
+T set-option -g remain-on-exit on   # corpses stay addressable => pane-died fires
 
 # 2. Spawn two worker panes, each an independent coding agent, tagged by role.
 T send-keys -t proj:impl.0 'claude' Enter ; T set-option -p -t proj:impl.0 @role worker
@@ -664,12 +818,13 @@ done
 T set-hook -g alert-silence 'run-shell "orchestrator wake #{pane_id}"'
 T set-hook -g pane-died     'run-shell "orchestrator handle-death #{pane_id} #{pane_dead_status}"'
 for p in proj:impl.0 proj:impl.1; do
-  T set-option -t "${p%.*}" monitor-silence 20     # silence => finished a step
+  T set-option -w -t "${p%.*}" monitor-silence 20  # silence => finished a step
 done
 
 # 6. Attend: read a worker, decide, route the next subtask (the control loop).
 read_pane() { T capture-pane -p -t "$1" -S -200; }
-route()     { T send-keys -t "$1" "$2" Enter; }
+route()     { T send-keys -t "$1" -l "$2"; T send-keys -t "$1" Enter; }
+barrier()   { T wait-for "$1"; }   # arm BEFORE dispatching the task that signals it
 gate()      { T display-popup -t proj -E "orchestrator review --hold $1"; }  # human
 
 # 7. Human attaches at the root to supervise; detaching leaves the swarm running.
