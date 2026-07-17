@@ -12,3 +12,4 @@ telegram_history.log
 *.aux
 *.out
 *.toc
+logs/
