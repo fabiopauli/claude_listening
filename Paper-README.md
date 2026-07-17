@@ -45,13 +45,13 @@ WORKER_CMD=codex ./swarm/swarm.sh up 2
 Then either drive it yourself:
 
 ```bash
-./swarm/swarm.sh dispatch 0 "run the test suite and summarize failures"
-./swarm/swarm.sh dispatch 1 "review the diff in src/ for concurrency bugs"
-./swarm/swarm.sh status          # who is busy, who is back at a prompt
+./swarm/swarm.sh dispatch 0 "run the tests; then ./swarm/swarm.sh done tests-0-1"
+./swarm/swarm.sh await tests-0-1 # block until worker 0 signals that unique id
+./swarm/swarm.sh status          # pane IDs, roles, @state, dead/silent flags
 ./swarm/swarm.sh capture 0 80    # read worker 0's last 80 lines
-./swarm/swarm.sh events          # silence/death event log
+./swarm/swarm.sh events          # silence/death watchdog log (not completion!)
 ./swarm/swarm.sh attach          # watch everything live (detach: C-b d)
-./swarm/swarm.sh down            # kill the swarm server
+./swarm/swarm.sh down            # kill the swarm server (this socket only)
 ```
 
 …or make the loop recursive: attach, go to the `orch` window, and paste
@@ -73,18 +73,24 @@ loop, eventually.
 
 | Script behavior | Paper section |
 |---|---|
-| Isolated socket, detached session, `remain-on-exit on` | §3.1 stacks; review W2/W5 |
+| Own socket (a namespace, not a sandbox), detached session, `remain-on-exit on` | §3.1; review W2, E7 |
+| Stable `%id` addressing via a pane registry; indexes never used for control | §3.5; review E5 |
+| One window per worker so the silence watchdog is per-worker | §3.5; review E6 |
 | `pipe-pane` logs per pane | §3.1 residual path |
-| `dispatch` uses `send-keys -l` + separate `Enter` | §3.2.1; review W7 |
-| `capture` / `status` with `@role`, `pane_current_command` | §3.2.1 keys and values |
-| `barrier` / `signal` via `wait-for`, armed before dispatch | §3.3; review W4 |
-| `monitor-silence` + hooks into `events.log` | §3.5 positional encoding |
-| You, attached at the root | §5.4 the regularizer |
+| `dispatch` uses `send-keys -l` + separate `Enter`, sets `@state busy` | §3.2.1; review W7 |
+| `capture` / `status` with `@role`/`@state` keys | §3.2.1 keys and values |
+| Explicit completion: `done <task-id>` / `await <task-id>`, unique per attempt | §3.3; review E1, E6 |
+| `monitor-silence` + hooks into `events.log` — watchdog only | §3.5; review E6 |
+| You, attached at the root, holding the only credentials | §5.4; review E8 |
 
 ## Safety notes
 
-- The orchestrator briefing hard-codes a **human gate**: nothing irreversible or
-  outward-facing (push, deploy, delete) without your explicit go-ahead.
+- **A tmux socket is a namespace, not a sandbox.** Separate sockets keep swarms
+  from colliding; they share your user, filesystem, credentials, and network.
+  Confining an untrusted agent takes an OS boundary (user/container/VM).
+- **The gate is a capability boundary.** Keep push/deploy/delete credentials out
+  of worker panes entirely; the orchestrator briefing has workers write pending
+  requests for you to review on attach, and only you execute them.
 - Don't run workers with permission checks disabled just to make the swarm
   smoother; the gate is the point (paper Table 2, row D: "fastest and least
   safe; not advised").

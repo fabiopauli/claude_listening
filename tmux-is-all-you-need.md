@@ -20,17 +20,19 @@ and makes the human the bottleneck and the single point of failure. We propose t
 terminal multiplexer `tmux`, dispensing with recurrence in the human entirely. In
 our architecture an *orchestrator* agent attends directly to any worker agent in
 the swarm through a small set of content- and address-based primitives —
-`send-keys`, `capture-pane`, `pipe-pane`, hooks, and `wait-for` — reducing the
-maximum path length between any two agents from *O(n)* sequential human operations
-to *O(1)* addressable operations. Because a tmux server persists independently of
+`send-keys`, `capture-pane`, `pipe-pane`, hooks, and `wait-for` — replacing the
+human relay on every coordination hop with addressed reads and writes on stable
+pane IDs. We are precise about what this buys: transport and supervision become
+cheap, durable, and scriptable, while the semantic work of orchestration remains
+exactly where it was, in the orchestrator. Because a tmux server persists independently of
 any attached client, and because a pane can itself run a tmux client, the
 architecture is *recursive*: an orchestrator can spawn sub-orchestrators, forming a
 tree of coordination while keeping the human attached at the root, in the loop,
-*eventually*. We show that tmux orchestration is superior to recurrent human
-management in three respects — total control operations per coordination step,
-number of required sequential human interventions, and maximum inter-agent path
-length — and we describe the primitives, the topology, and the control loop in
-enough detail to reproduce a semi-autonomous, human-supervised agent swarm.
+*eventually*. We compare orchestration substrates on separated metrics — human
+interventions in the inner loop, semantic re-emissions per data hop, transport to a
+known agent, and discovery cost — and we describe the primitives, the topology, and
+the control loop in enough detail to reproduce a semi-autonomous, human-supervised
+agent swarm.
 
 ---
 
@@ -55,12 +57,13 @@ limitations, both familiar from the recurrent sequence-modeling literature
    not parallel. Throughput is bounded by human cycle time, not by the number of
    available agents or cores.
 
-2. **Path length.** To route a result produced by agent *A* into the working
+2. **The relay.** To route a result produced by agent *A* into the working
    context of agent *B*, the operator must read *A*, hold the result in working
-   memory, context-switch, and re-type it to *B*. Connecting any two of *n* agents
-   costs *O(n)* sequential human operations, and every such hop passes through the
-   single-threaded hidden state *h_t*. Long dependency chains degrade the
-   representation exactly as long-range dependencies degrade an RNN.
+   memory, context-switch, and re-type it to *B*. The hop count is constant —
+   *A* → relay → *B* — but every hop crosses the single-threaded hidden state
+   *h_t*: it is serialized behind all other hops, paid at human latency, and lossy
+   in exactly the way *h_t* is lossy. Long dependency chains degrade through
+   repeated re-encoding much as long-range dependencies degrade an RNN.
 
 Attention mechanisms [Bahdanau et al., 2015] dissolved the analogous problem in
 sequence modeling by allowing any position to be reached from any other in a
@@ -77,9 +80,10 @@ The contributions of this paper are:
 
 - A mapping from the components of self-attention onto concrete tmux primitives
   (§3), including scaled selection (§3.2.1), multi-head orchestration (§3.2.2), and
-  positional encoding via the session/window/pane address space (§3.5).
-- A "Why Tmux" analysis (§4) comparing orchestration substrates by control cost,
-  required human interventions, and inter-agent path length.
+  positional encoding via stable pane identity and event time (§3.5).
+- A "Why Tmux" analysis (§4) comparing orchestration substrates on separated
+  metrics — human interventions, semantic re-emissions, transport, and discovery —
+  rather than a single overloaded "path length".
 - A description of how to deploy, batch, schedule, and regularize a live swarm
   (§5), including the human-in-the-loop gate as an explicit regularizer.
 
@@ -161,8 +165,13 @@ The encoder and decoder are composed of a stack of identical structural layers,
 provided by tmux's three-level hierarchy:
 
 - **Server** — one per socket (`-L name` / `-S /path/socket`), a namespace holding
-  all sessions. Distinct sockets give fully isolated swarms that cannot address one
-  another, useful for sandboxing untrusted sub-swarms.
+  all sessions. Distinct sockets give separate servers whose sessions, channels,
+  and options cannot collide — *namespace separation*, which must not be mistaken
+  for a sandbox. Every server runs as the same user on the same filesystem with the
+  same credentials, and any process of that user may connect to any socket it can
+  name. Confining an untrusted agent takes an OS boundary (a separate user,
+  container, or VM) and credential scoping; tmux contributes tidiness, not
+  security.
 - **Session** — a durable collection of windows, detachable from any client. One
   session per project or per major objective.
 - **Window** — a full-screen layer within a session, tiled into panes. One window
@@ -201,19 +210,22 @@ Let the swarm be a set of panes `P = {p_1, …, p_n}`. Each pane exposes, via tm
 **value** `v_i` — its current content:
 
 ```
-k_i  =  ( #{session_name}, #{window_index}, #{pane_index},
-          #{pane_current_command}, #{pane_title}, #{@role},
-          #{pane_dead}, #{alternate_on}, #{?window_activity_flag,…} )
+k_i  =  ( #{pane_id}, #{@role}, #{@task_id}, #{@state},
+          #{pane_current_command}, #{pane_title},
+          #{pane_dead}, #{window_silence_flag} )
 
-v_i  =  capture-pane -p -t "#{session_name}:#{window_index}.#{pane_index}"
+v_i  =  capture-pane -p -t "#{pane_id}"
 ```
+
+The address in every key is `pane_id` — the immutable `%N` the server assigns at
+creation — never a window/pane *index*, which is a presentation coordinate that
+renumbers under topology changes (§3.5).
 
 The keys are cheaply enumerable for the whole swarm in a single call:
 
 ```bash
-tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} \
-  cmd=#{pane_current_command} role=#{@role} dead=#{pane_dead} \
-  silent=#{?pane_dead,-,#{window_silence_flag}}'
+tmux list-panes -a -F '#{pane_id} role=#{@role} state=#{@state} \
+  cmd=#{pane_current_command} dead=#{pane_dead}'
 ```
 
 #### 3.2.1 Scaled Dot-Product Attention (Scaled Selection)
@@ -231,20 +243,20 @@ pane's key fields that the orchestrator evaluates with `list-panes -f` /
 and tagged as reviewers":
 
 ```bash
-tmux list-panes -a -f '#{&&:#{==:#{@role},reviewer},#{==:#{pane_current_command},bash}}' \
-  -F '#{session_name}:#{window_index}.#{pane_index}'
+tmux list-panes -a -f '#{&&:#{==:#{@role},reviewer},#{==:#{@state},idle}}' \
+  -F '#{pane_id}'
 ```
 
-The scaling factor `1/√d_k` has a concrete operational meaning. As the swarm grows,
-raw relevance scores over many panes tend to produce a diffuse selection — the
-orchestrator tries to attend to too many workers at once, its control bandwidth
-saturates, and the softmax pushes into regions of vanishing marginal attention per
-agent (the human, watching, experiences this as thrash). We counteract this by
-scaling down relevance with swarm breadth, `d_k` ≈ number of distinguishing key
-fields active at the current depth, keeping *fan-out bounded*: each orchestration
-step reads and writes a small, sharp set of panes rather than a blurred average of
-all of them. Empirically, top-*k* (hard) selection — `head -k` on the filtered pane
-list — is the sparse limit of this softmax and is what we use in deployment.
+The scaling factor `1/√d_k` is where the analogy is at its most decorative, and we
+say so plainly: multiplying every score by the same positive constant changes no
+ranking, so it cannot change what any hard top-*k* selects. What the factor guards
+in the original — selection staying sharp as dimensionality grows — is real here,
+but it is enforced by choosing *k*, the per-step fan-out, small and fixed. In
+deployment the "softmax" is a Boolean format predicate over pane keys followed by a
+capped number of reads: filter, then bound. Where genuine ranking is wanted
+(most-recently-quiet first, longest-blocked first), the orchestrator computes a
+numeric score per pane and sorts — tmux supplies the fields (`#{t:…}` timestamps,
+user options), not the ordering.
 
 Reading a value is `capture-pane`; writing to the selected panes is `send-keys`:
 
@@ -261,8 +273,8 @@ paste-buffer path, which moves an arbitrary blob into a pane's input without
 per-character escaping:
 
 ```bash
-tmux load-buffer  -b task ./subtask-prompt.txt
-tmux paste-buffer -b task -t "$target"
+tmux load-buffer  -b "task-$id" ./subtask-prompt.txt   # unique buffer per task,
+tmux paste-buffer -d -b "task-$id" -t "$target"        # freed on paste (-d)
 ```
 
 Two practical notes. First, `send-keys` interprets key names — `Enter`, `C-c` — so
@@ -285,8 +297,12 @@ and which key fields that head considers relevant. Multi-head orchestration lets
 architecture jointly attend to information from different parts of the project at
 different phases: e.g. head 1 supervises implementation panes, head 2 supervises a
 test/CI pane, head 3 supervises a documentation pane, and head 4 watches a
-long-running build. The heads run truly concurrently because each pane is an
-independent OS process; there is no time-slicing of a single operator.
+long-running build. We are careful about where the concurrency lives: the *workers*
+under each head run concurrently as independent OS processes, but a single
+orchestrator walking the windows remains one decision process, time-slicing its own
+attention — a window is an organizational scope, not a thread. Decision-level
+parallelism requires one orchestrator process per head, which is exactly the
+recursion of §4: a head that matters enough is given its own sub-orchestrator pane.
 
 The heads are combined by concatenation into a shared **blackboard** — persistent
 key/value state stored in tmux user-options, readable and writable by any head:
@@ -307,8 +323,8 @@ The architecture uses orchestration attention in three ways:
 1. **Orchestrator→worker cross-attention.** The decoder (orchestrator) queries over
    all encoder (worker) panes: it reads their captured state and writes their next
    instruction. This is the analog of encoder–decoder attention — every orchestrator
-   decision may attend over *every* worker's output, at *O(1)* path length via
-   direct pane addressing.
+   decision may attend over *every* worker's output, via addressed reads and writes
+   on stable pane IDs.
 
 2. **Worker self-attention.** Workers attend to one another *without routing through
    the orchestrator* when a direct pipe is authorized: `capture-pane -p -t A | …
@@ -349,12 +365,16 @@ exclusion over the shared working tree, preventing two workers from writing the 
 files concurrently — the coordination analog of not letting two FFNs update the same
 position at once.
 
-One sharp edge deserves emphasis: channels are server-global and signals are *not
-queued*. A `wait-for -S` fired while no one is waiting is simply lost, and a waiter
-arriving afterwards blocks forever — the barrier must be armed *before* the subtask
-that will signal it is dispatched. Recursive sub-swarms sharing a socket must
-namespace their channels; better, give each sub-swarm its own socket (§3.1) so the
-collision is impossible by construction.
+Two properties deserve emphasis. First, a signal on a channel with no waiter is not
+lost: the server latches one wake, and the next waiter consumes it. But it is a
+*one-bit latch*, not a counting queue — early signals coalesce, and a reused
+channel can hand a stale wake to the wrong consumer. The discipline that follows is
+one globally unique channel per task attempt (`done:$swarm:$task:$attempt`), never
+reused. Second, channels are server-global, so recursive sub-swarms take their own
+sockets (§3.1) and collisions become impossible by construction. `wait-for -L`/`-U`,
+finally, is an *advisory* mutex among cooperating scripts: nothing compels a worker
+to take it, and a crashed holder releases nothing, so a real lock carries an owner
+record and recovery logic beside it.
 
 ### 3.4 Embeddings and Readout
 
@@ -369,6 +389,14 @@ parse their replies): the orchestrator's prompt conventions and its output parse
 are two directions of one shared protocol, which for control-mode clients is the
 `%`-prefixed structured stream itself [tmux Control Mode wiki].
 
+A caveat keeps this section honest. `capture-pane` returns the rendered grid and
+retained history — a picture of a terminal, not a message stream — and `pipe-pane`
+admits one pipe per pane, streaming only while attached. For an operator's console
+this is exactly right; as the sole data plane of an autonomous protocol it lacks
+framing, acknowledgement, and schema. Deployment therefore moves payloads over a
+thin per-worker file protocol with atomic renames (§5.1) and reserves the terminal
+for what it is: an attention surface, not a message bus.
+
 ### 3.5 Positional Encoding
 
 The swarm, as described, is a *set* of panes — orchestration attention is
@@ -376,15 +404,21 @@ permutation-invariant and by itself carries no notion of which agent came first 
 which subtask depends on which. Since dependency order matters, we must inject
 information about the position of each agent in the topology and in time.
 
-Tmux supplies positional structure natively. Each pane has a **discrete spatial
-coordinate** — `(session, window_index, pane_index)` — that is stable for the pane's
-lifetime and totally ordered under `base-index`/`pane-base-index`. We combine this
-with a **temporal coordinate** from event hooks and the `#{t:…}` time formats, so
-each agent carries a position signal analogous to the sinusoidal encoding, letting
-the orchestrator reason about dependency order without a recurrent scan:
+Tmux supplies identity and order natively, provided one uses the right coordinates.
+Each pane has a **unique ID** (`#{pane_id}`, the `%N` the server assigns at
+creation), immutable for the pane's lifetime; sessions and windows carry `$N` and
+`@N` likewise. Window and pane *indexes*, by contrast, are presentation
+coordinates: they renumber under `break-pane`, `join-pane`, `swap-pane`, and
+`move-window` — the very operations §5.3 uses to reshape the swarm mid-run.
+Scripts therefore address panes by ID and keep semantic position in explicit
+per-pane user options (`@role`, `@task_id`, `@state`); indexes are for the human's
+fingers. We combine identity with a **temporal coordinate** from event hooks and
+the `#{t:…}` time formats, so each agent carries a position signal analogous to the
+sinusoidal encoding, letting the orchestrator reason about dependency order without
+a recurrent scan:
 
 ```
-PE(pane) = ( window_index · B + pane_index ,        # spatial position
+PE(pane) = ( pane_id , @task_id ,                   # identity and dependency position
              timestamp of last state change )         # temporal position
 ```
 
@@ -392,7 +426,7 @@ The temporal component is maintained *event-drivenly* by hooks rather than by
 polling, which is where tmux's notification system does real work:
 
 ```bash
-# Stamp a pane's position in time whenever it goes quiet (likely: finished a step)
+# Stamp when a pane goes quiet (a watchdog event, not a completion signal)
 tmux set-hook -g alert-silence \
   'set-option -p @last_silent "#{t:window_activity}" ; run-shell "notify-orchestrator #{pane_id}"'
 
@@ -406,14 +440,17 @@ Available hook events include `pane-died`, `alert-activity`, `alert-silence`,
 others [tmux Hooks wiki]. Note that `pane-died` fires only when `remain-on-exit` is
 `on`, leaving the corpse addressable for a `capture-pane` post-mortem before
 `respawn-pane`; with the default `off` the pane closes and the weaker `pane-exited`
-fires — the evidence leaves with it. Activity/silence monitoring is enabled per
-window with `monitor-activity on` and `monitor-silence <seconds>`; a pane that has
-been silent for *s* seconds is, with high probability, a worker that has finished
-its step and is waiting — precisely the event the orchestrator must attend to next.
-The heuristic admits false positives — an agent deep in a long inference is also
-silent — so silence is corroborated against the pane's key before acting:
-`pane_current_command` back at a shell is completion; still `claude` is
-contemplation. This gives
+fires — the evidence leaves with it. Activity/silence monitoring is enabled with
+`monitor-activity on` and `monitor-silence <seconds>` — these are *window* options,
+and `alert-silence` fires per window, so a per-worker silence watchdog wants one
+window per worker, which the multi-head layout already provides. And it is a
+*watchdog*, never a completion protocol: silence cannot distinguish a finished
+worker from one mid-inference, blocked on the network, deadlocked, or waiting for
+confirmation — and `pane_current_command` is only a corroborating hint, since a TUI
+agent stays in the foreground whether generating or idle. Completion is therefore
+explicit: the worker's last act is to set `@state done` and signal its unique
+per-attempt channel (§3.3); silence merely tells the orchestrator where to look
+when nothing has been said for too long. This gives
 the swarm a *positional* sense of "who just spoke and who just went quiet" that is
 computed once, event-drivenly, rather than re-derived by a sequential human sweep.
 
@@ -422,42 +459,44 @@ computed once, event-drivenly, rather than re-derived by a sequential human swee
 ## 4. Why Tmux
 
 In this section we compare the tmux orchestration substrate to alternatives —
-recurrent human management and centralized-process orchestration — on three desiderata.
+recurrent human management and centralized-process orchestration. An earlier draft
+compressed the comparison into a single "path length"; an adversarial reviewer
+correctly observed that *A* → relay → *B* is a constant number of hops however slow
+the relay, and that a substrate scan such as `list-panes -f` is linear in the panes
+inspected however few round trips it takes. We therefore separate the metrics:
+*human interventions* required in the inner loop; *semantic re-emissions* per data
+hop, the number of times a payload must cross a deciding process — a mind or a
+model — to move between two agents; *transport cost* to reach an agent whose
+address is already known; and *discovery cost* to find out which agent that is.
 
-One is the total control cost per coordination step. Another is the amount of
-computation that *must be sequential*, measured as the number of unavoidable human
-interventions in the inner loop. The third is the maximum path length between any
-two agents that must exchange information; shorter paths make it easier to route a
-result produced deep in the swarm into the context of a distant consumer, so we also
-compare the maximum length of these forwarding paths.
+**Table 1: Separated coordination metrics.** "Semantic re-emissions" counts the
+times a payload crosses a deciding process (a mind or a model) to move between two
+agents; transport assumes the target's pane ID is already known; discovery is a
+single `list-panes` round trip that enumerates all *n* panes server-side.
 
-**Table 1: Maximum path length, per-step sequential operations, and human
-interventions for different orchestration substrates.** *n* is the number of
-agents in the swarm; *k* the fan-out of a single orchestration step (*k* ≪ *n*).
+| Substrate | Human ops, inner loop | Sem. re-emissions / hop | Transport (known agent) | Discovery |
+|---|---|---|---|---|
+| Recurrent human management | every hop | 1 (the operator) | serial re-type | *O(n)* visual scan |
+| Central-process orchestrator | none | 1 (the process) | *O(1)* IPC | process-dependent |
+| **Tmux orchestration (this work)** | **gate only** | **0** on authorized pipes | *O(1)* addressed, `-t %id` | *O(n)* scan, 1 round trip |
 
-| Substrate | Control ops / step | Sequential (human) ops | Max inter-agent path |
-|---|---:|---:|---:|
-| Recurrent human management | *O(n)* | *O(n)* | *O(n)* |
-| Central-process orchestrator | *O(n)* | *O(1)* | *O(n)* through the process |
-| **Tmux orchestration (this work)** | *O(k)* | *O(1)*, at the gate only | ***O(1)*** |
-
-As noted in Table 1, a self-attending orchestrator connects any two agents in a
-constant number of addressable operations (`capture-pane -t A … | send-keys -t B`),
-whereas recurrent human management requires the human to personally relay every hop,
-serializing the whole swarm through one mind. A central-process orchestrator removes
-the human from each hop but re-introduces an *O(n)* bottleneck at the process that
-must parse and re-emit every message; tmux avoids this because the *substrate
-itself* is the router — panes are directly addressable and can be wired
-worker-to-worker without a relay.
+The honest reading of Table 1 is that tmux buys the two middle columns. A data hop
+between workers whose IDs are known (`capture-pane -t %4 … | send-keys -t %7`)
+crosses no deciding process at all, where recurrent management pays the operator's
+working memory on every hop and a central-process design pays a
+parse–decide–re-emit cycle. What tmux does *not* buy is any reduction in semantic
+work: it selects no recipients, interprets no dependencies, reconciles no
+conflicts, and trusts no output — every decision still happens in the orchestrator,
+whose reasoning costs are identical across substrates and appear in no column. Tmux
+replaces terminal-switching and process-management labor, not judgment.
 
 An adversarial reader will object that the tmux server is itself a single central
-process. The distinction is the layer at which it routes: the server moves bytes
-between pseudo-terminals without parsing them, holds no conversation state, and
-re-emits nothing through a language model's context window. The *O(n)* we charge
-the central-process design is *semantic* bandwidth — every message crossing an
-application-level orchestrator's parse–decide–re-emit cycle — not file-descriptor
-bandwidth. Table 1 counts transport and decision operations; the orchestrator's own
-reasoning cost is identical across substrates and is not what any column measures.
+process. It is — and that is the point of the middle column. The server moves
+bytes between pseudo-terminals without parsing them, holds no conversation state,
+and re-emits nothing through a context window, so a hop through it counts zero
+semantic re-emissions. The charge against the central-process design is not that
+it is central but that it is *semantically* central: every payload crosses its
+parse–decide–re-emit cycle whether or not that payload needed a decision.
 
 Two further, non-tabulated benefits motivated the choice of tmux:
 
@@ -492,6 +531,13 @@ the same step and proceed in parallel; dependent subtasks are serialized behind
 sized to keep fan-out *k* bounded (§3.2.1) so the orchestrator's control bandwidth —
 and the human's review bandwidth — is not saturated.
 
+Two further disciplines carry the batching in practice. Each worker owns a separate
+Git *worktree* — a shared index turns independent subtasks into merge conflicts you
+scheduled for yourself — and payloads travel through a thin per-worker *shim*: task
+and result envelopes as files delivered by atomic rename, with the pane's terminal
+carrying the agent's face rather than the freight. Tmux wakes, supervises, and
+displays; the files remember.
+
 ### 5.2 Hardware and Schedule
 
 A swarm runs on a single host (or a `tmux -S` socket shared over SSH), one pane per
@@ -501,7 +547,13 @@ and a *dispatch* phase triggered when a pane goes silent, dies, or signals
 completion. Control mode (`-CC`) is used when the orchestrator is itself an agent:
 it reads the `%`-prefixed notification stream (`%output`, `%window-pane-changed`,
 `%exit`, …) directly rather than screen-scraping, which is both cheaper and
-unambiguous [tmux Control Mode wiki].
+unambiguous [tmux Control Mode wiki]. A production control-mode client is real
+engineering, not a line-oriented loop: it must correlate `%begin`/`%end`/`%error`
+responses with the commands that caused them, tolerate escaped and non-UTF-8
+output, honor the protocol's flow control so a slow reader does not fall behind,
+and resynchronize with `capture-pane` after a disconnect. We use the notification
+stream for wakes and supervision, keep payloads on the file protocol of §5.1, and
+declare a fully general control-mode parser future work.
 
 ### 5.3 Optimizer (the Control Loop)
 
@@ -535,13 +587,18 @@ sub-result into its own window, or collapsing a finished head.
 We employ several regularizers to prevent the swarm from overfitting to a locally
 plausible but globally wrong plan:
 
-- **Human-gate.** The single most important regularizer is the human-in-the-loop
-  gate: before any batch of decisions with irreversible or outward-facing effects
-  (a push, a deploy, a destructive command) propagates, it is surfaced to the
-  attached human via `display-popup`, `confirm-before`, or a `choose-tree` review,
-  and blocked on `wait-for` until acknowledged. The human is thus in the loop
-  *eventually and where it matters*, not in every inner iteration — the analog of
-  applying regularization at the layer boundaries rather than to every activation.
+- **Human-gate.** The single most important regularizer, and the easiest to fake.
+  A popup is an interface, not an enforcement mechanism — with no client attached
+  there is nowhere to draw it, and a worker holding push credentials needs nobody's
+  permission. The gate is therefore a *capability boundary*. Workers run without
+  credentials for protected operations (a push, a deploy, a destructive command); a
+  request for one is persisted to disk and the swarm moves on; the human reviews
+  pending requests on attach, with `display-popup` and `choose-tree` as how the
+  queue looks, not why it holds; and a broker that alone holds the credentials
+  validates and executes the exact approved command. Direct worker-to-worker pipes
+  (§3.2.3) carry data, never authority. The human is thus in the loop *eventually
+  and where it matters*, not in every inner iteration — the analog of applying
+  regularization at the layer boundaries rather than to every activation.
 
 - **Silence dropout.** Panes that have been silent beyond a threshold are treated as
   dropped for the current step (`monitor-silence`), forcing the orchestrator not to
@@ -558,16 +615,22 @@ plausible but globally wrong plan:
 
 We report qualitative and illustrative operational results; a rigorous benchmark of
 swarm throughput across task suites is left to future work, and the figures below
-are illustrative of the regime rather than a controlled measurement.
+are illustrative of the regime rather than a controlled measurement. The benchmark
+that would settle it is well-defined — dispatch and result latency,
+false-completion rate under the silence watchdog, recovery time after worker and
+orchestrator crashes, and merge-conflict rate of shared trees versus per-worker
+worktrees — and this section's claims should be read as bounded by it.
 
 ### 6.1 Orchestration Throughput
 
-Replacing recurrent human relay with *O(1)* pane addressing removes the human from
-the inner loop, so wall-clock throughput scales with *available parallel workers*
-rather than *human cycle time*, up to the point where review bandwidth at the gate
-(§5.4) becomes the binding constraint. The practical effect is that a single
-operator supervises a swarm whose aggregate work rate is set by *k* concurrent
-agents rather than by one.
+Replacing the human relay with addressed pane operations removes the human from
+the inner loop, so wall-clock throughput can scale with *available parallel
+workers* rather than *human cycle time* — for genuinely independent tasks, and
+only until something else binds: review bandwidth at the gate (§5.4), CPU, API
+rate limits, repository contention, or the test infrastructure. Parallelism is a
+ceiling, not a guarantee. Within it, a single operator supervises a swarm whose
+aggregate rate is set by *k* concurrent agents rather than by one, minus
+everything the previous sentence lists.
 
 ### 6.2 Architecture Variations
 
@@ -605,11 +668,11 @@ inside a pane, only its address and its `@role` — the substrate is model-agnos
 In this work we presented the Tmux Orchestration Architecture, a model for
 supervising coding-agent swarms based entirely on the terminal multiplexer,
 replacing recurrent human management with direct, addressable attention between
-agents. For orchestration tasks, a single agent driving a tmux swarm connects any
-two workers in *O(1)* operations, removes the human from the inner loop, and — by
-virtue of the server outliving its clients and panes being able to run tmux
-themselves — supports detachable, recursive, semi-autonomous operation with the
-human retained as a supervisory gate.
+agents. For orchestration tasks, a single agent driving a tmux swarm reaches any
+worker by stable pane ID, removes the human from the inner loop, and — by virtue
+of the server outliving its clients and panes being able to run tmux themselves —
+supports detachable, recursive, semi-autonomous operation with the human retained
+as a supervisory gate.
 
 We are excited about the future of substrate-level agent orchestration and plan to
 apply it to swarms larger than a single host (federating over `tmux -S` sockets and
@@ -617,8 +680,11 @@ SSH), to learned selection policies that replace hand-written format filters, an
 tighter human-gate ergonomics. The code and conventions to reproduce a swarm are the
 tmux commands given throughout this paper.
 
-We make one claim, plainly: for keeping many coding agents alive, addressable, and
-mutually routable under one human's supervision — **tmux is all you need**.
+We make one claim, plainly, and scope it honestly: for the *supervision layer* —
+keeping many coding agents alive, addressable, observable, and interruptible under
+one human — **tmux is all you need**. For state, transport, and authority, tmux is
+precisely what you should not use; knowing which layer you are standing in is the
+architecture.
 
 ---
 
@@ -651,47 +717,46 @@ who stayed in the loop, eventually.
 
 ### Appendix A: Minimal Reproducible Swarm
 
-A complete two-worker swarm with an orchestrator, a human gate, and event-driven
-scheduling, expressed entirely in tmux:
+A minimal two-worker swarm — session, per-worker windows, stable pane IDs,
+watchdogs, and explicit completion — expressed entirely in tmux. It is a
+supervisor and a console, not a full orchestrator: scheduling policy, the worker
+shim of §5.1, and the credential broker of §5.4 live outside it. A maintained
+version, with a pane registry, event log, and demo mode, ships alongside this
+paper as `swarm/swarm.sh`.
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-SOCK="swarm"                       # isolated server namespace: tmux -L "$SOCK"
+SOCK="swarm"; LOG="$PWD/logs"; mkdir -p "$LOG"
 T() { tmux -L "$SOCK" "$@"; }
-mkdir -p logs
 
-# 1. Create the durable, detached session (survives human detach).
-T new-session -d -s proj -n impl
-T set-option -g remain-on-exit on   # corpses stay addressable => pane-died fires
-
-# 2. Spawn two worker panes, each an independent coding agent, tagged by role.
-T send-keys -t proj:impl.0 'claude'  Enter ; T set-option -p -t proj:impl.0 @role worker
-T split-window -t proj:impl -h
-T send-keys -t proj:impl.1 'codex'   Enter ; T set-option -p -t proj:impl.1 @role worker
-
-# 3. A dedicated head (window) for the orchestrator.
-T new-window -t proj -n orch
+# 1. Durable, detached session; corpses stay addressable (pane-died needs it).
+T new-session -d -s proj -n orch
+T set-option -g remain-on-exit on
 T set-option -p -t proj:orch.0 @role orchestrator
 
-# 4. Residual logging for every worker pane.
-for p in proj:impl.0 proj:impl.1; do
-  T pipe-pane -o -t "$p" "cat >> logs/${p//[:.]/_}.log"
+# 2. One window per worker (per-worker silence watchdog); record stable pane IDs.
+for w in 0 1; do
+  id=$(T new-window -dP -t proj -n "w$w" -F '#{pane_id}')
+  T set-option -p -t "$id" @role worker ; T set-option -p -t "$id" @state idle
+  T pipe-pane   -o -t "$id" "cat >> '$LOG/worker-$w.log'"
+  T set-option  -w -t "proj:w$w" monitor-silence 20   # watchdog, NOT completion
+  T send-keys -t "$id" -l 'claude' ; T send-keys -t "$id" Enter
+  echo "$w $id" >> "$LOG/registry"                    # index -> immutable %id
 done
 
-# 5. Positional / event encoding: react when a worker goes quiet or dies.
-T set-hook -g alert-silence 'run-shell "orchestrator wake #{pane_id}"'
-T set-hook -g pane-died     'run-shell "orchestrator handle-death #{pane_id} #{pane_dead_status}"'
-for p in proj:impl.0 proj:impl.1; do
-  T set-option -w -t "${p%.*}" monitor-silence 20  # silence => finished a step
-done
+# 3. Watchdog events land in an append-only log the orchestrator tails.
+T set-hook -g alert-silence "run-shell \"echo silence #{pane_id} >> '$LOG/events'\""
+T set-hook -g pane-died     "run-shell \"echo died #{pane_id} #{pane_dead_status} >> '$LOG/events'\""
 
-# 6. Attend: read a worker, decide, route the next subtask (the control loop).
-read_pane()  { T capture-pane -p -t "$1" -S -200; }
-route()      { T send-keys -t "$1" -l "$2"; T send-keys -t "$1" Enter; }
-barrier()    { T wait-for "$1"; }  # arm BEFORE dispatching the task that signals it
-gate()       { T display-popup -t proj -E "orchestrator review --hold $1"; }  # human, eventually
+# 4. Address by %id; completion is explicit, unique per attempt, never inferred.
+dispatch() { T send-keys -t "$1" -l "$2" ; T send-keys -t "$1" Enter ; }
+read_pane(){ T capture-pane -p -J -t "$1" -S -200 ; }
+await()    { T wait-for  "done:$1" ; }    # one-bit latch: one channel per attempt
+finish()   { T set-option -p -t "$TMUX_PANE" @state done
+             T wait-for -S "done:$1" ; }  # a worker's last act, run in its pane
 
-# 7. Human attaches at the root to supervise; detaching leaves the swarm running.
+# 5. The human attaches at the root; detaching stops nothing. The gate of §5.4
+#    is a credential broker, not a function this script could contain.
 #    tmux -L swarm attach -t proj      # choose-tree (C-b s / C-b w) to watch heads
 ```
